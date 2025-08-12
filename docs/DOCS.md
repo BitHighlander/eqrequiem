@@ -24,142 +24,89 @@ The issue stems from the thin instance buffer management system in Babylon.js:
 #### 1. Fixed Thin Instance Buffer Management
 **File**: `client/src/Game/Model/entity-cache.ts`
 
-```typescript
+The implementation resizes the per-instance texture backing store whenever a new thin instance is added. This keeps the GPU-side buffer dimensions in sync with `thinInstanceCount` and avoids WebGPU validation errors.
+
+```390:423:client/src/Game/Model/entity-cache.ts
 const addThinInstance = (matrix: BJS.Matrix): number => {
-  // Prevent concurrent updates
-  if (isUpdating) {
-    console.warn('[EntityCache] Thin instance update already in progress');
-    return -1;
+  const instanceIdx = mergedMesh.thinInstanceAdd(matrix, true);
+  const originalBuffer = (mergedMesh.metadata?.textureAttributeArray
+    ?._texture?._bufferView ?? new Float32Array()) as Float32Array;
+  const newWidth = submeshCount * mergedMesh.thinInstanceCount;
+  const data = new Float32Array(4 * newWidth);
+  data.set(originalBuffer, 0);
+  mergedMesh.thinInstanceSetAttributeAt(
+    'thinInstanceIndex',
+    instanceIdx,
+    [instanceIdx, 0],
+    true,
+  );
+  if (mergedMesh.metadata.textureAttributeArray) {
+    mergedMesh.metadata.textureAttributeArray.dispose();
   }
-  isUpdating = true;
-  
-  try {
-    // Add instance without automatic refresh
-    const instanceIdx = mergedMesh.thinInstanceAdd(matrix, false);
-    
-    // Update texture array for new instance count
-    const originalBuffer = (mergedMesh.metadata?.textureAttributeArray
-      ?._texture?._bufferView ?? new Float32Array()) as Float32Array;
-    const newWidth = submeshCount * mergedMesh.thinInstanceCount;
-    const data = new Float32Array(4 * newWidth);
-    data.set(originalBuffer, 0);
-    
-    // Create fresh texture at correct size
-    const fresh = new BABYLON.RawTexture(data, newWidth, 1, /* ... */);
-    mergedMesh.metadata.textureAttributeArray = fresh;
-    
-    // Manually refresh buffers after all updates
-    mergedMesh.thinInstanceBufferUpdated('matrix');
-    mergedMesh.thinInstanceBufferUpdated('thinInstanceIndex');
-    mergedMesh.thinInstanceRefreshBoundingInfo(false);
-    
-    return instanceIdx;
-  } catch (error) {
-    console.error('[EntityCache] Failed to add thin instance:', error);
-    return -1;
-  } finally {
-    isUpdating = false;
-  }
+  const fresh = new BABYLON.RawTexture(
+    data,
+    newWidth,
+    1,
+    BABYLON.Constants.TEXTUREFORMAT_RGBA,
+    scene,
+    false,
+    false,
+    BABYLON.Constants.TEXTURE_NEAREST_NEAREST_MIPNEAREST,
+    BABYLON.Constants.TEXTURETYPE_FLOAT,
+  );
+  mergedMesh.metadata.textureAttributeArray = fresh;
+  return instanceIdx;
 };
 ```
 
-#### 2. Enhanced Entity Creation Error Handling
-**File**: `client/src/Game/Model/entity.ts`
+Where the per-frame matrix buffer flush occurs:
 
-```typescript
-private instantiateMeshes() {
-  const thinInstanceIndex = addThinInstance(worldMat);
-  
-  if (thinInstanceIndex === -1) {
-    console.error(`[Entity] Failed to add thin instance for ${this.spawn.name}`);
-    return;
-  }
-  
-  this.meshInstance = { mesh: mesh as BJS.Mesh, thinInstanceIndex };
-  console.log(`[Entity] Successfully instantiated mesh for ${this.spawn.name}`);
-}
-```
-
-#### 3. Server-Side Spawn System Improvements
-**File**: `server/internal/zone/zone-handlers.go`
-
-- Fixed spawn data exchange between players
-- Added proper character appearance fields (race, gender, size, equipment)
-- Moved spatial grid registration to after all spawn exchanges complete
-- Enhanced debugging and error handling
-
-### Movement Smoothing System
-
-#### Problem
-Player movement appears choppy due to direct position updates without interpolation.
-
-#### Solution
-**File**: `client/src/Game/Zone/entity-pool.ts`
-
-```typescript
-UpdateSpawnPosition(sp: EntityPositionUpdateBase) {
-  const e = this.entities[sp.spawnId];
-  if (!e || !e.spawn) return;
-
-  // Store target for smooth interpolation
-  const now = performance.now();
-  const deltaTime = now - e.lastUpdateTime;
-  
-  if (deltaTime > 16) { // ~60 FPS threshold
-    e.targetPosition = { x: sp.position.x, y: sp.position.y, z: sp.position.z };
-    e.interpolationStartTime = now;
-    e.interpolationDuration = Math.min(deltaTime * 1.2, 100);
-    e.lastUpdateTime = now;
-  }
-}
-
-async process() {
-  const now = performance.now();
-  
-  for (const entity of Object.values(this.entities)) {
-    if (!entity.targetPosition || !entity.interpolationStartTime) continue;
-    
-    const elapsed = now - entity.interpolationStartTime;
-    const progress = Math.min(elapsed / entity.interpolationDuration, 1.0);
-    
-    if (progress < 1.0) {
-      const eased = this.easeOutQuart(progress);
-      const currentPos = entity.position;
-      const targetPos = entity.targetPosition;
-      
-      const newX = currentPos.x + (targetPos.x - currentPos.x) * eased;
-      const newY = currentPos.y + (targetPos.y - currentPos.y) * eased;
-      const newZ = currentPos.z + (targetPos.z - currentPos.z) * eased;
-      
-      entity.setPosition(newX, newY, newZ);
-    } else {
-      entity.setPosition(entity.targetPosition.x, entity.targetPosition.y, entity.targetPosition.z);
-      entity.interpolationStartTime = undefined;
+```548:567:client/src/Game/Model/entity-cache.ts
+EntityCache.renderObserver = scene.onAfterRenderCameraObservable.add((camera) => {
+  const meshes = new Set<BJS.Mesh>();
+  for (const entity of EntityCache.entityInstances) {
+    if (entity.hidden) {
+      continue;
+    }
+    for (const mesh of entity.syncMatrix()) {
+      meshes.add(mesh);
     }
   }
-}
+  for (const mesh of meshes) {
+    mesh?.thinInstanceBufferUpdated('matrix');
+  }
+});
 ```
 
-### Performance Optimizations
+#### 2. Entity instantiation of thin instances
+**File**: `client/src/Game/Model/entity.ts`
 
-1. **Server Movement Updates**: Increased from 20Hz (50ms) to ~30Hz (33ms) for smoother updates
-2. **Client Interpolation**: Added eased interpolation with 60 FPS threshold
-3. **Concurrent Protection**: Mutex-like protection for thin instance updates
+```361:367:client/src/Game/Model/entity.ts
+const { mesh, addThinInstance } = this.entityContainer;
+const thinInstanceIndex = addThinInstance(worldMat);
+this.meshInstance = {
+  mesh: mesh as BJS.Mesh,
+  thinInstanceIndex,
+};
+```
 
-### Testing Results
+#### 3. Notes on server-side spawns
+This document focuses on client thin instance buffers. Server spawn logic is out of scope here.
 
-- ✅ Multiple players can join without WebGPU crashes
-- ✅ Player meshes render correctly (not just nameplates)
-- ✅ Smooth movement interpolation eliminates choppiness
-- ✅ Physics and collision work for all players
-- ✅ Position updates and animations sync properly
+### Movement smoothing
+Not implemented in `client/src/Game/Zone/entity-pool.ts` at this time; the `process()` loop is currently empty and `UpdateSpawnPosition` applies positions/velocities directly.
+
+### Additional notes
+
+- Matrices are updated with `thinInstanceSetMatrixAt(..., /* noFlush= */ false)` in `Entity.syncMatrix`, then flushed once per frame in the render observer.
+- The per-instance attribute `thinInstanceIndex` is set per instance add.
+
+### Testing
+
+Validated locally with multiple entities joining the scene using WebGPU; buffer sizes matched `thinInstanceCount` and no validation errors were observed during instance growth.
 
 ### Upstream Contribution Potential
 
-This fix addresses a fundamental issue in Babylon.js thin instance management that could affect any WebGPU-based application using dynamic thin instances. The solution provides:
-
-1. **Thread Safety**: Prevents concurrent buffer updates
-2. **Buffer Synchronization**: Ensures GPU buffers match instance counts
-3. **Error Recovery**: Graceful handling of buffer allocation failures
+This focuses on ensuring per-instance buffers are resized when `thinInstanceCount` grows, avoiding WebGPU validation errors in dynamic thin instance scenarios.
 
 Consider contributing the thin instance buffer management improvements to the BabylonJS project as it resolves WebGPU validation errors in multi-entity scenarios.
